@@ -47,6 +47,17 @@ pub struct FetchResponse {
     pub body: String,
     pub cookies: Vec<ResponseCookie>,
     pub user_agent: String,
+    /// Downloaded <img> resources, when requested via the server API.
+    pub download: Option<Vec<DownloadedImage>>,
+}
+
+/// JSON representation of an image downloaded from the fetched page.
+#[derive(Debug, Clone, Serialize)]
+pub struct DownloadedImage {
+    pub url: String,
+    pub filename: String,
+    pub mime_type: String,
+    pub encoded_data: String,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -85,6 +96,8 @@ pub struct SolveRequest {
     pub session: Option<String>,
     pub session_ttl_minutes: Option<u64>,
     pub return_screenshot: Option<bool>,
+    #[serde(default)]
+    pub download: bool,
     pub post_data: Option<String>,
     pub headers: Option<HashMap<String, String>>,
 }
@@ -154,6 +167,8 @@ pub struct Solution {
     pub user_agent: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub screenshot: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub download: Option<Vec<DownloadedImage>>,
 }
 
 #[cfg(feature = "server")]
@@ -167,6 +182,7 @@ impl From<FetchResponse> for Solution {
             cookies: r.cookies,
             user_agent: r.user_agent,
             screenshot: None,
+            download: r.download,
         }
     }
 }

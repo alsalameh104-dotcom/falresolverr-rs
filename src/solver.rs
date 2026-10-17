@@ -1,4 +1,10 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+
+use base64::{engine::general_purpose::STANDARD, Engine as _};
+use reqwest::{
+    header::{CONTENT_LENGTH, CONTENT_TYPE, COOKIE, REFERER, USER_AGENT},
+    Url,
+};
 use std::time::{Duration, Instant};
 
 use chaser_cf::core::BrowserManager;
@@ -12,7 +18,7 @@ use chaser_oxide::layout::Point;
 use chaser_oxide::{ChaserPage, Page};
 
 use crate::error::{FlareSolverError, Result};
-use crate::models::{FetchResponse, RequestCookie, ResponseCookie};
+use crate::models::{DownloadedImage, FetchResponse, RequestCookie, ResponseCookie};
 
 #[cfg(feature = "server")]
 use crate::session::SessionStore;
@@ -392,6 +398,25 @@ pub async fn fetch(
     extra_cookies: &[RequestCookie],
     max_timeout_ms: u64,
 ) -> Result<FetchResponse> {
+    fetch_with_download(
+        browser, url, is_post, post_data, proxy_url,
+        extra_cookies, max_timeout_ms, false,
+    )
+    .await
+}
+
+/// Like `fetch`, but optionally downloads rendered page <img> resources.
+#[allow(clippy::too_many_arguments)]
+pub async fn fetch_with_download(
+    browser: &BrowserManager,
+    url: &str,
+    is_post: bool,
+    post_data: Option<&str>,
+    proxy_url: Option<&str>,
+    extra_cookies: &[RequestCookie],
+    max_timeout_ms: u64,
+    download: bool,
+) -> Result<FetchResponse> {
     let started = Instant::now();
     let deadline = started + Duration::from_millis(max_timeout_ms);
     let mut attempt = 0u32;
@@ -399,7 +424,7 @@ pub async fn fetch(
         attempt += 1;
         let remaining = deadline.saturating_duration_since(Instant::now());
         match fetch_once(
-            browser, url, is_post, post_data, proxy_url, extra_cookies, remaining,
+            browser, url, is_post, post_data, proxy_url, extra_cookies, remaining, download,
         )
         .await
         {
@@ -453,7 +478,9 @@ async fn fetch_once(
     proxy_url: Option<&str>,
     extra_cookies: &[RequestCookie],
     max: Duration,
+    download: bool,
 ) -> Result<FetchResponse> {
+    let fetch_started = Instant::now();
     let proxy = proxy_url
         .filter(|p| !p.is_empty())
         .map(parse_proxy_url)
@@ -558,13 +585,32 @@ async fn fetch_once(
         .flatten()
         .unwrap_or_else(|| url.to_string());
 
-    let cookies = page
+    let cookies: Vec<ResponseCookie> = page
         .get_cookies()
         .await
         .unwrap_or_default()
         .into_iter()
         .map(|c| chaser_cookie_to_response(oxide_to_chaser_cookie(c)))
         .collect();
+
+    // Preserve the Python customization: with download=true, retrieve each <img>
+    // using a separate HTTP client, passing the page URL as Referer and applicable
+    // browser cookies. The browser remains open until image URLs are collected.
+    // The image fetches are bounded by the remaining request timeout.
+    let downloaded = if download {
+        let budget = max.saturating_sub(fetch_started.elapsed());
+        let imgs = if budget.is_zero() {
+            tracing::warn!("image download skipped: request timeout budget exhausted");
+            Vec::new()
+        } else {
+            download_page_images(&chaser, &final_url, &cookies, &user_agent, proxy_url, budget)
+                .await
+        };
+        tracing::info!("downloaded {} images from {final_url}", imgs.len());
+        Some(imgs)
+    } else {
+        None
+    };
 
     let _ = page.close().await;
 
@@ -577,7 +623,248 @@ async fn fetch_once(
         body,
         cookies,
         user_agent,
+        download: downloaded,
     })
+}
+
+
+// ── Optional image download support (compatible with the customized Python API) ──
+// Return at most 100 images to avoid unbounded API responses. Up to 8 MiB per
+// image and 32 MiB of decoded bytes total (Base64 increases the JSON payload).
+const MAX_IMAGES: usize = 100;
+const MAX_IMAGE_BYTES: usize = 8 * 1024 * 1024;
+const MAX_TOTAL_IMAGE_BYTES: usize = 32 * 1024 * 1024;
+
+/// Enumerate <img> sources in the rendered document and fetch their bytes.
+/// Like the original Python customization, these are **separate HTTP requests**;
+/// browser challenge clearance is not guaranteed to work for every image host.
+async fn download_page_images(
+    chaser: &ChaserPage,
+    page_url: &str,
+    cookies: &[ResponseCookie],
+    user_agent: &str,
+    proxy_url: Option<&str>,
+    budget: Duration,
+) -> Vec<DownloadedImage> {
+    let deadline = Instant::now() + budget;
+    let mut builder = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .redirect(reqwest::redirect::Policy::limited(5));
+
+    if let Some(url) = proxy_url.filter(|p| !p.is_empty()) {
+        match reqwest::Proxy::all(url) {
+            Ok(proxy) => builder = builder.proxy(proxy),
+            Err(e) => {
+                tracing::warn!("invalid image downloader proxy: {e}");
+                return Vec::new();
+            }
+        }
+    }
+
+    let client = match builder.build() {
+        Ok(client) => client,
+        Err(e) => {
+            tracing::warn!("image HTTP client could not be initialized: {e}");
+            return Vec::new();
+        }
+    };
+
+    // currentSrc handles srcset/picture; falling back to src matches Python.
+    const IMAGE_SOURCES_JS: &str = r#"Array.from(document.images, img =>
+        img.currentSrc || img.getAttribute('src') || img.getAttribute('data-src') || ''
+    )"#;
+    let sources = match tokio::time::timeout(
+        deadline.saturating_duration_since(Instant::now()),
+        chaser.evaluate(IMAGE_SOURCES_JS),
+    )
+    .await
+    {
+        Ok(Ok(Some(v))) => v,
+        Ok(Ok(None)) => {
+            tracing::warn!("page image enumeration returned no value");
+            return Vec::new();
+        }
+        Ok(Err(e)) => {
+            tracing::warn!("page image enumeration failed: {e}");
+            return Vec::new();
+        }
+        Err(_) => {
+            tracing::warn!("page image enumeration timed out");
+            return Vec::new();
+        }
+    };
+    let Some(items) = sources.as_array() else {
+        tracing::warn!("page image enumeration did not return an array");
+        return Vec::new();
+    };
+    let Ok(base_url) = Url::parse(page_url) else {
+        tracing::warn!("cannot parse page URL for image downloads");
+        return Vec::new();
+    };
+
+    let mut unique = HashSet::new();
+    let mut results = Vec::new();
+    let mut total_bytes: usize = 0;
+
+    for value in items {
+        let Some(src) = value.as_str().filter(|s| !s.is_empty()) else {
+            continue;
+        };
+        let Ok(image_url) = base_url.join(src) else {
+            continue;
+        };
+        if !matches!(image_url.scheme(), "http" | "https") {
+            continue;
+        }
+        if !unique.insert(image_url.as_str().to_owned()) {
+            continue;
+        }
+        if unique.len() > MAX_IMAGES || total_bytes >= MAX_TOTAL_IMAGE_BYTES {
+            break;
+        }
+
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            tracing::warn!("image download time budget reached; returning partial results");
+            break;
+        }
+        match tokio::time::timeout(
+            remaining,
+            download_one_image(&client, &image_url, page_url, cookies, user_agent),
+        )
+        .await
+        {
+            Ok(Some((image, byte_len))) => {
+                if total_bytes + byte_len > MAX_TOTAL_IMAGE_BYTES {
+                    tracing::warn!("image download total-size limit reached");
+                    break;
+                }
+                total_bytes += byte_len;
+                results.push(image);
+            }
+            Ok(None) => {} // Individual image failed; try the next one.
+            Err(_) => {
+                tracing::warn!("image download time budget reached; returning partial results");
+                break;
+            }
+        }
+    }
+    results
+}
+
+/// Build a domain/path/HTTPS-scoped Cookie header so cookies from the page are
+/// not sent indiscriminately to arbitrary third-party image hosts.
+fn image_cookie_header(url: &Url, cookies: &[ResponseCookie]) -> String {
+    let host = url.host_str().unwrap_or_default().to_ascii_lowercase();
+    let path = url.path();
+    cookies
+        .iter()
+        .filter(|c| {
+            if c.secure && url.scheme() != "https" {
+                return false;
+            }
+            if !path.starts_with(&c.path) {
+                return false;
+            }
+            let domain = c.domain.to_ascii_lowercase();
+            if let Some(suffix) = domain.strip_prefix('.') {
+                host == suffix || host.ends_with(&format!(".{suffix}"))
+            } else {
+                !domain.is_empty() && host == domain
+            }
+        })
+        .map(|c| format!("{}={}", c.name, c.value))
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+async fn download_one_image(
+    client: &reqwest::Client,
+    image_url: &Url,
+    page_url: &str,
+    cookies: &[ResponseCookie],
+    user_agent: &str,
+) -> Option<(DownloadedImage, usize)> {
+    let mut request = client
+        .get(image_url.clone())
+        .header(USER_AGENT, user_agent)
+        .header(REFERER, page_url);
+
+    let cookie_header = image_cookie_header(image_url, cookies);
+    if !cookie_header.is_empty() {
+        request = request.header(COOKIE, cookie_header);
+    }
+
+    let mut response = match request.send().await {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!("image request failed for {image_url}: {e}");
+            return None;
+        }
+    };
+    if response.status() != reqwest::StatusCode::OK {
+        tracing::debug!("image HTTP status {} for {image_url}", response.status());
+        return None;
+    }
+
+    let mime_type = response
+        .headers()
+        .get(CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("application/octet-stream")
+        .to_string();
+    if !mime_type.to_ascii_lowercase().starts_with("image/") {
+        tracing::debug!("image URL returned non-image content-type {mime_type}: {image_url}");
+        return None;
+    }
+
+    if response
+        .headers()
+        .get(CONTENT_LENGTH)
+        .and_then(|h| h.to_str().ok())
+        .and_then(|s| s.parse::<usize>().ok())
+        .is_some_and(|n| n > MAX_IMAGE_BYTES)
+    {
+        tracing::debug!("image too large: {image_url}");
+        return None;
+    }
+
+    let mut data = Vec::new();
+    loop {
+        let chunk = match response.chunk().await {
+            Ok(chunk) => chunk,
+            Err(e) => {
+                tracing::warn!("error reading image body {image_url}: {e}");
+                return None;
+            }
+        };
+        let Some(chunk) = chunk else { break };
+        if data.len() + chunk.len() > MAX_IMAGE_BYTES {
+            tracing::debug!("image exceeds size cap: {image_url}");
+            return None;
+        }
+        data.extend_from_slice(&chunk);
+    }
+    if data.is_empty() {
+        return None;
+    }
+
+    let filename = image_url
+        .path_segments()
+        .and_then(|segments| segments.last())
+        .filter(|name| !name.is_empty())
+        .unwrap_or("image")
+        .to_string();
+    let size = data.len();
+    Some((
+        DownloadedImage {
+            url: image_url.to_string(),
+            filename,
+            mime_type,
+            encoded_data: STANDARD.encode(data),
+        },
+        size,
+    ))
 }
 
 /// POST from the page's own JS context — same cookies, origin, and TLS/fingerprint
@@ -802,6 +1089,28 @@ pub async fn dispatch(
     extra_cookies: &[RequestCookie],
     max_timeout_ms: u64,
 ) -> Result<(String, String, Option<FetchResponse>)> {
+    dispatch_with_download(
+        store, cmd, url, is_post, post_data, proxy_url,
+        session_id, extra_cookies, max_timeout_ms, false,
+    )
+    .await
+}
+
+/// The /v1 HTTP API uses this entrypoint to preserve the Python download flag.
+#[cfg(feature = "server")]
+#[allow(clippy::too_many_arguments)]
+pub async fn dispatch_with_download(
+    store: &Arc<SessionStore>,
+    cmd: &str,
+    url: Option<&str>,
+    is_post: bool,
+    post_data: Option<&str>,
+    proxy_url: Option<&str>,
+    session_id: Option<&str>,
+    extra_cookies: &[RequestCookie],
+    max_timeout_ms: u64,
+    download: bool,
+) -> Result<(String, String, Option<FetchResponse>)> {
     match cmd {
         "request.get" | "request.post" => {
             let url = url.ok_or_else(|| FlareSolverError::MissingField("url".into()))?;
@@ -813,7 +1122,7 @@ pub async fn dispatch(
                 .or_else(|| proxy_url.map(str::to_string))
                 .or_else(resolve_env_proxy);
             let browser = store.browser().await?;
-            let resp = fetch(
+            let resp = fetch_with_download(
                 browser,
                 url,
                 is_post,
@@ -821,6 +1130,7 @@ pub async fn dispatch(
                 effective_proxy.as_deref(),
                 extra_cookies,
                 max_timeout_ms,
+                download,
             )
             .await?;
             Ok(("ok".into(), String::new(), Some(resp)))

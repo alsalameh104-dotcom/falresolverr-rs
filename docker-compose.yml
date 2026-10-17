@@ -8,12 +8,6 @@ services:
       dockerfile: Dockerfile.build
     ports:
       - "8191:8191"
-    restart: unless-stopped
-
-  flaresolverr-py:
-    image: ghcr.io/flaresolverr/flaresolverr:latest
-    ports:
-      - "8192:8191"
     environment:
-      - LOG_LEVEL=info
+      - FLARESOLVERR_LOG_LEVEL=info,flaresolverr_rs=debug
     restart: unless-stopped
