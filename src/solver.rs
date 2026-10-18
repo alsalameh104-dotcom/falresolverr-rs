@@ -417,6 +417,27 @@ pub async fn fetch_with_download(
     max_timeout_ms: u64,
     download: bool,
 ) -> Result<FetchResponse> {
+    fetch_with_page_options(
+        browser, url, is_post, post_data, proxy_url,
+        extra_cookies, max_timeout_ms, download, 0, 0, 0,
+    ).await
+}
+
+/// Optional page scrolling and extra wait; preserves existing fetch interfaces.
+#[allow(clippy::too_many_arguments)]
+pub async fn fetch_with_page_options(
+    browser: &BrowserManager,
+    url: &str,
+    is_post: bool,
+    post_data: Option<&str>,
+    proxy_url: Option<&str>,
+    extra_cookies: &[RequestCookie],
+    max_timeout_ms: u64,
+    download: bool,
+    scroll: u32,
+    smooth_scroll: u32,
+    wait_in_seconds: u64,
+) -> Result<FetchResponse> {
     let started = Instant::now();
     let deadline = started + Duration::from_millis(max_timeout_ms);
     let mut attempt = 0u32;
@@ -425,6 +446,7 @@ pub async fn fetch_with_download(
         let remaining = deadline.saturating_duration_since(Instant::now());
         match fetch_once(
             browser, url, is_post, post_data, proxy_url, extra_cookies, remaining, download,
+            scroll, smooth_scroll, wait_in_seconds,
         )
         .await
         {
@@ -479,6 +501,9 @@ async fn fetch_once(
     extra_cookies: &[RequestCookie],
     max: Duration,
     download: bool,
+    scroll: u32,
+    smooth_scroll: u32,
+    wait_in_seconds: u64,
 ) -> Result<FetchResponse> {
     let fetch_started = Instant::now();
     let proxy = proxy_url
@@ -551,6 +576,15 @@ async fn fetch_once(
     }
 
     solve_and_wait(&page, &chaser, max).await;
+
+    // Python-compatible order: solve, scroll, smooth scroll, wait, then HTML capture.
+    // Never exceed the request's remaining time budget.
+    if scroll > 0 || smooth_scroll > 0 || wait_in_seconds > 0 {
+        perform_page_scrolls(
+            &chaser, scroll, smooth_scroll, wait_in_seconds,
+            max.saturating_sub(fetch_started.elapsed()),
+        ).await;
+    }
 
     let user_agent = chaser
         .evaluate("navigator.userAgent")
@@ -627,6 +661,75 @@ async fn fetch_once(
     })
 }
 
+
+// Page interaction compatible with the customized Python FlareSolverr API.
+// Each requested scroll moves approximately 80% of the viewport. Python used
+// 10 seconds per scroll; wait is bounded by the remaining request budget here.
+async fn perform_page_scrolls(
+    chaser: &ChaserPage,
+    scroll: u32,
+    smooth_scroll: u32,
+    wait_in_seconds: u64,
+    budget: Duration,
+) {
+    let deadline = Instant::now() + budget;
+    // Bound potentially untrusted request values to avoid extremely long loops.
+    let scroll = scroll.min(100);
+    let smooth_scroll = smooth_scroll.min(100);
+    for i in 0..scroll {
+        if Instant::now() >= deadline { break; }
+        tracing::info!("Scrolling {}/{}", i + 1, scroll);
+        if let Err(e) = chaser.evaluate("window.scrollBy(0, Math.floor(window.innerHeight * 0.8));").await {
+            tracing::warn!("normal scroll failed: {e}");
+            break;
+        }
+        sleep_with_deadline(deadline, Duration::from_secs(10)).await;
+    }
+    if scroll > 0 { tracing::info!("Scrolling finished after {scroll} requested scrolls"); }
+    for i in 0..smooth_scroll {
+        if Instant::now() >= deadline { break; }
+        tracing::info!("Smooth scrolling {}/{}", i + 1, smooth_scroll);
+        // Use small incremental scrolls rather than returning before an async
+        // JavaScript animation finishes. No additional browser dependencies.
+        for _ in 0..24 {
+            if Instant::now() >= deadline { break; }
+            if let Err(e) = chaser.evaluate("window.scrollBy(0, Math.max(1, Math.floor(window.innerHeight * 0.8 / 24)));").await {
+                tracing::warn!("smooth scroll failed: {e}");
+                break;
+            }
+            sleep_with_deadline(deadline, Duration::from_millis(15)).await;
+        }
+        sleep_with_deadline(deadline, Duration::from_secs(10)).await;
+    }
+    if smooth_scroll > 0 { tracing::info!("Smooth scrolling finished after {smooth_scroll} requested scrolls"); }
+    if wait_in_seconds > 0 {
+        tracing::info!("Waiting {wait_in_seconds} seconds before returning the response");
+        sleep_with_deadline(deadline, Duration::from_secs(wait_in_seconds.min(3600))).await;
+    }
+    // A brief stabilization window for lazy-loaded content after scroll.
+    if scroll > 0 || smooth_scroll > 0 {
+        let mut last_len: Option<u64> = None;
+        let mut stable_since = Instant::now();
+        let settle_deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if Instant::now() >= deadline || Instant::now() >= settle_deadline { break; }
+            let state = read_page_state(chaser).await;
+            if last_len != Some(state.dom_len) {
+                last_len = Some(state.dom_len);
+                stable_since = Instant::now();
+            }
+            if state.ready && stable_since.elapsed() >= Duration::from_millis(1000) { break; }
+            sleep_with_deadline(deadline, Duration::from_millis(300)).await;
+        }
+    }
+}
+
+async fn sleep_with_deadline(deadline: Instant, requested: Duration) {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if !remaining.is_zero() {
+        tokio::time::sleep(remaining.min(requested)).await;
+    }
+}
 
 // ── Optional image download support (compatible with the customized Python API) ──
 // Return at most 100 images to avoid unbounded API responses. Up to 8 MiB per
@@ -1111,6 +1214,29 @@ pub async fn dispatch_with_download(
     max_timeout_ms: u64,
     download: bool,
 ) -> Result<(String, String, Option<FetchResponse>)> {
+    dispatch_with_page_options(
+        store, cmd, url, is_post, post_data, proxy_url, session_id,
+        extra_cookies, max_timeout_ms, download, 0, 0, 0,
+    ).await
+}
+
+#[cfg(feature = "server")]
+#[allow(clippy::too_many_arguments)]
+pub async fn dispatch_with_page_options(
+    store: &Arc<SessionStore>,
+    cmd: &str,
+    url: Option<&str>,
+    is_post: bool,
+    post_data: Option<&str>,
+    proxy_url: Option<&str>,
+    session_id: Option<&str>,
+    extra_cookies: &[RequestCookie],
+    max_timeout_ms: u64,
+    download: bool,
+    scroll: u32,
+    smooth_scroll: u32,
+    wait_in_seconds: u64,
+) -> Result<(String, String, Option<FetchResponse>)> {
     match cmd {
         "request.get" | "request.post" => {
             let url = url.ok_or_else(|| FlareSolverError::MissingField("url".into()))?;
@@ -1122,7 +1248,7 @@ pub async fn dispatch_with_download(
                 .or_else(|| proxy_url.map(str::to_string))
                 .or_else(resolve_env_proxy);
             let browser = store.browser().await?;
-            let resp = fetch_with_download(
+            let resp = fetch_with_page_options(
                 browser,
                 url,
                 is_post,
@@ -1131,6 +1257,9 @@ pub async fn dispatch_with_download(
                 extra_cookies,
                 max_timeout_ms,
                 download,
+                scroll,
+                smooth_scroll,
+                wait_in_seconds,
             )
             .await?;
             Ok(("ok".into(), String::new(), Some(resp)))

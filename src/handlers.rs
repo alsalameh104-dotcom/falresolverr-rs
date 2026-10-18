@@ -6,7 +6,7 @@ use axum::{extract::State, Json};
 use crate::error::FlareSolverError;
 use crate::models::{Solution, SolveRequest, SolveResponse};
 use crate::session::SessionStore;
-use crate::solver::dispatch_with_download;
+use crate::solver::dispatch_with_page_options;
 
 pub type AppState = Arc<SessionStore>;
 
@@ -20,7 +20,7 @@ pub async fn solve_v1(
     // Fold separate username/password proxy fields into the URL (Prowlarr/
     // FlareSolverr send them split out); otherwise the credentials are dropped.
     let proxy_url = req.proxy.as_ref().and_then(|p| p.effective_url());
-    let (status, message, solution) = dispatch_with_download(
+    let (status, message, solution) = dispatch_with_page_options(
         &store,
         &req.cmd,
         req.url.as_deref(),
@@ -31,6 +31,9 @@ pub async fn solve_v1(
         req.cookies.as_deref().unwrap_or(&[]),
         req.max_timeout,
         req.download,
+        req.scroll,
+        req.smooth_scroll,
+        req.wait_in_seconds,
     )
     .await?;
 

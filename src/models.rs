@@ -98,6 +98,15 @@ pub struct SolveRequest {
     pub return_screenshot: Option<bool>,
     #[serde(default)]
     pub download: bool,
+    /// Normal page scrolls (80% of viewport per step).
+    #[serde(default)]
+    pub scroll: u32,
+    /// Incremental smooth scrolls (80% of viewport per step).
+    #[serde(default)]
+    pub smooth_scroll: u32,
+    /// Extra wait after scrolling, in seconds.
+    #[serde(default)]
+    pub wait_in_seconds: u64,
     pub post_data: Option<String>,
     pub headers: Option<HashMap<String, String>>,
 }
