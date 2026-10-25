@@ -7,7 +7,7 @@ services:
       context: .
       dockerfile: Dockerfile.build
     ports:
-      - "8191:8191"
+      - "8193:8191"
     environment:
       - FLARESOLVERR_LOG_LEVEL=info,flaresolverr_rs=debug
     restart: unless-stopped
